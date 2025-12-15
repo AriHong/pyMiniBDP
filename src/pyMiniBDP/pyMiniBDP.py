@@ -12,74 +12,6 @@ import statsmodels.api as sm
 from tqdm import tqdm
 from scipy import stats
 
-def hosmer_lemeshow_test(y_true, y_pred_proba, n_groups=10):
-    """
-    Performs the Hosmer-Lemeshow goodness-of-fit test.
-
-    Args:
-        y_true (array-like): True binary outcomes (0 or 1).
-        y_pred_proba (array-like): Predicted probabilities from the logistic regression model.
-        n_groups (int): Number of groups for the test (default is 10).
-
-    Returns:
-        tuple: HL statistic, p-value
-    """
-    # Create a DataFrame for easier grouping
-    df = pd.DataFrame({'y_true': y_true, 'y_pred_proba': y_pred_proba})
-
-    # Create groups based on predicted probabilities
-    df['group'] = pd.qcut(df['y_pred_proba'], q=n_groups, labels=False, duplicates='drop')
-
-    # Calculate observed and expected frequencies for each group
-    grouped_data = df.groupby('group').agg(
-        n_j=('y_true', 'count'),
-        o_j=('y_true', 'sum'),
-        mean_pred_proba=('y_pred_proba', 'mean')
-    ).reset_index()
-
-    # Calculate expected events
-    grouped_data['e_j'] = grouped_data['n_j'] * grouped_data['mean_pred_proba']
-
-    # Calculate the Hosmer-Lemeshow statistic
-    hl_statistic = np.sum(
-        (grouped_data['o_j'] - grouped_data['e_j'])**2 / 
-        (grouped_data['n_j'] * grouped_data['mean_pred_proba'] * (1 - grouped_data['mean_pred_proba']))
-    )
-    
-    # Degrees of freedom
-    df_hl = n_groups - 2
-
-    # P-value
-    p_value = 1 - chi2.cdf(hl_statistic, df_hl)
-
-    return hl_statistic, p_value
-
-
-def logistic_regression_with_stats(panel=None, BP=None, n_groups=10):
-
-    idx = [np.where(BP.gene_names == g)[0][0] for g in panel]
-    X = BP.X
-    y = BP.y
-    
-    Xsub = X[:, idx]
-    if BP.added_coef:
-        X_ = Xsub.copy()
-        X_ = np.concatenate([X_, BP.mcoef.reshape(-1,1)], axis=1)
-    if BP.mcoef is not None:
-        X_ = Xsub.copy()
-    model = LogisticRegression(max_iter=500)
-    model.fit(X_, y)
-
-    predict = model.predict(Xsub)
-    predict_proba = model.predict_proba(Xsub)
-    
-    r2score = r2_score(y, predict)
-    adj_r2score =  1 - (1 - r2score) * (len(y) - 1) / (len(y) - X_.shape[1] - 1)
-
-    hl_stat, pval = hosmer_lemeshow_test(y, predict_proba[:, 1], n_groups=10)
-       
-    
-    return(pval, r2score, adj_rscore, Xsub, model)
     
 
 def evaluate_kfold(X, y, n_splits=10):
@@ -89,7 +21,8 @@ def evaluate_kfold(X, y, n_splits=10):
     for tr, te in kf.split(X):
         Xtr, Xte = X[tr], X[te]
         ytr, yte = y[tr], y[te]
-
+        if len(np.unique(yte))==1:
+            continue
         model = LogisticRegression(max_iter=500)
         model.fit(Xtr, ytr)
 
@@ -101,14 +34,16 @@ def evaluate_kfold(X, y, n_splits=10):
         sens.append(tp / (tp + fn))
         specs.append(tn / (tn + fp))
 
-    return np.mean(aucs), np.mean(sens), np.mean(specs)
+    return np.mean(aucs), np.mean(sens), np.mean(specs), np.std(aucs), np.std(sens), np.std(specs)
 
-def evaluate_rsbmr(X, y, repeat=5):
+def evaluate_rsbmr(X, y, repeat=5, test_size=0.3):
     aucs, sens, specs = [], [], []
     for r in range(repeat):
         Xtr, Xte, ytr, yte = train_test_split(
-            X, y, test_size=0.3, stratify=y, random_state=r
+            X, y, test_size=test_size, stratify=y, random_state=r
         )
+        if len(np.unique(yte))==1:
+            continue
         
         model = LogisticRegression(max_iter=500)
         model.fit(Xtr, ytr)
@@ -121,7 +56,7 @@ def evaluate_rsbmr(X, y, repeat=5):
         sens.append(tp / (tp + fn))
         specs.append(tn / (tn + fp))
 
-    return np.mean(aucs), np.mean(sens), np.mean(specs)
+    return np.mean(aucs), np.mean(sens), np.mean(specs), np.std(aucs), np.std(sens), np.std(specs)
 
 
 class BiomarkerPipeline:
@@ -135,7 +70,9 @@ class BiomarkerPipeline:
     """
 
     def __init__(self, adata, layer="center", y_col="Prognosis",
-                 n_iter=1000, panel_size=10, top_n=200, window=10, gen_subp_sliding=False,
+                 n_iter=1000, panel_size=10, top_n=200, window=10, 
+                 kfold=10, rsbmr_repeat=5, 
+                 gen_subp_sliding=False,
                 added_coef=False):
         
         # Config
@@ -148,6 +85,9 @@ class BiomarkerPipeline:
         self.window = window
         self.gen_subp_sliding = gen_subp_sliding
         self.added_coef = added_coef
+        self.kfold=kfold
+        self.rsbmr_repeat= rsbmr_repeat
+        
         
         # Extract data
         self.X = adata.layers[layer]
@@ -211,6 +151,7 @@ class BiomarkerPipeline:
         flat = rf_panels.flatten()
         
         self.gene_freq = pd.Series(flat).value_counts()
+        self.gene_freq = self.gene_freq[self.gene_freq>=2]
         self.gene_ordered = np.array(self.gene_freq.index)
         top_n = min(len(self.gene_ordered), top_n)
         self.top_genes = self.gene_ordered[:top_n]  
@@ -251,6 +192,14 @@ class BiomarkerPipeline:
         senB_ = np.zeros((len(subpanels), window-1))
         specA_ = np.zeros((len(subpanels), window-1))
         specB_ = np.zeros((len(subpanels), window-1))
+
+        aucAstd_ = np.zeros((len(subpanels), window-1))
+        aucBstd_ = np.zeros((len(subpanels), window-1))
+        senAstd_ = np.zeros((len(subpanels), window-1))
+        senBstd_ = np.zeros((len(subpanels), window-1))
+        specAstd_ = np.zeros((len(subpanels), window-1))
+        specBstd_ = np.zeros((len(subpanels), window-1))
+        
         genes = []
                             
         
@@ -274,8 +223,8 @@ class BiomarkerPipeline:
                 
                 #hl_p = hosmer_lemeshow_test(y, result.predict())
     
-                aucA, senA, specA = evaluate_kfold(Xsel, y)
-                aucB, senB, specB = evaluate_rsbmr(Xsel, y)
+                aucA, senA, specA, aucAstd, senAstd, specAstd = evaluate_kfold(Xsel, y, self.kfold)
+                aucB, senB, specB, aucBstd, senBstd, specBstd = evaluate_rsbmr(Xsel, y, self.rsbmr_repeat)
     
                 aucA_[i, w] = aucA
                 aucB_[i, w] = aucB
@@ -284,6 +233,13 @@ class BiomarkerPipeline:
                 specA_[i, w] = specA
                 specB_[i, w] = specB
 
+                aucAstd_[i, w] = aucAstd
+                aucBstd_[i, w] = aucBstd
+                senAstd_[i, w] = senAstd
+                senBstd_[i, w] = senBstd
+                specAstd_[i, w] = specAstd
+                specBstd_[i, w] = specBstd
+
         self.aucA_ = aucA_
         self.aucB_ = aucB_
         self.senA_ = senA_
@@ -291,6 +247,13 @@ class BiomarkerPipeline:
         self.specA_ = specA_
         self.specB_ = specB_
 
+        self.aucAstd_ = aucAstd_
+        self.aucBstd_ = aucBstd_
+        self.senAstd_ = senAstd_
+        self.senBstd_ = senBstd_
+        self.specAstd_ = specAstd_
+        self.specBstd_ = specBstd_
+        
         self.genes = genes
 
     
