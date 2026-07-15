@@ -15,6 +15,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
 from sklearn.metrics import roc_auc_score, confusion_matrix
 
+warnings.filterwarnings('ignore')
 
 from .utils import *
 
@@ -23,6 +24,7 @@ class BiomarkerPipelineKFold:
     - Repeated Stratified K-Fold 
     - Univariate filtering 
     - Elastic Net 
+    - Permutation test 
     - Holdout option
     """
 
@@ -60,15 +62,8 @@ class BiomarkerPipelineKFold:
         self.rf_selection_size = rf_selection_size
         self.n_splits = n_splits
         self.n_repeats = n_repeats
+        self.added_coef = added_coef
         
-        if isinstance(added_coef, str):
-            self.added_coef = [added_coef]
-        elif added_coef is None:
-            self.added_coef = []
-        else:
-            self.added_coef = list(added_coef)
-        
-            
         # Feature selection 
         self.univariate_threshold = univariate_threshold
         self.highfreq_quantile = highfreq_quantile
@@ -97,30 +92,30 @@ class BiomarkerPipelineKFold:
                 f"Feature dimension mismatch: X has {self.X_raw.shape[1]} columns, "
                 f"but adata.var_names has {len(self.gene_names)} names."
             )
-
+        
         if self.added_coef:
-            # Keep covariates as a two-dimensional numeric matrix.
-            # In this study, age should be supplied as a continuous numeric value.
-            self.M_raw = adata.obs[self.added_coef].to_numpy(dtype=float)
+            self.M_raw = adata.obs[self.added_coef].values
         else:
             self.M_raw = None
-            
 
         y_raw = adata.obs[y_col].astype(str)
         unique_labels = np.unique(y_raw)
 
-        if len(unique_labels) != 2:
-            raise ValueError(
-                f"Binary outcome required, but {len(unique_labels)} classes were found: "
-                f"{list(unique_labels)}"
-            )
-        if positive_label is None or positive_label not in unique_labels:
-            raise ValueError(
-                f"positive_label={positive_label!r} was not found in {list(unique_labels)}."
-            )
-
-        self.y = np.asarray((y_raw == positive_label).astype(int), dtype=int)
-        self.class_names_ = np.array([f"not_{positive_label}", positive_label])        
+        if positive_label is not None and positive_label in unique_labels:
+            self.y = (y_raw == positive_label).astype(int)
+            self.label_encoder = None
+            self.class_names_ = np.array([f"not_{positive_label}", positive_label])
+        else:
+            le = LabelEncoder()
+            self.y = le.fit_transform(y_raw)
+            self.label_encoder = le
+            self.class_names_ = le.classes_
+            if len(self.class_names_) == 2 and self.verbose:
+                warnings.warn(
+                    f"positive_label={positive_label!r} was not found. "
+                    f"Using LabelEncoder order: {self.class_names_[0]}=0, {self.class_names_[1]}=1."
+                )
+        
 
         
         n_samples = self.X_raw.shape[0]
@@ -188,30 +183,22 @@ class BiomarkerPipelineKFold:
         self.final_model = None
         self.final_selected_genes = None
         self.holdout_performance = None
+        self.permutation_results = None
+
         self.final_x_scaler = None
         self.final_m_scaler = None
         self.cv_mean_metrics = None
 
+
     def _scale_train_test(self, X_train_raw, X_test_raw, M_train_raw=None, M_test_raw=None):
-        if self.standardscale:
-            x_scaler = StandardScaler()
-            X_train = x_scaler.fit_transform(X_train_raw)
-            X_test = x_scaler.transform(X_test_raw)
-        else:
-            x_scaler = None
-            X_train = np.asarray(X_train_raw, dtype=float)
-            X_test = np.asarray(X_test_raw, dtype=float)
+        x_scaler = StandardScaler()
+        X_train = x_scaler.fit_transform(X_train_raw)
+        X_test = x_scaler.transform(X_test_raw)
 
         if M_train_raw is not None:
-            M_train_raw = np.asarray(M_train_raw, dtype=float)
-            M_test_raw = np.asarray(M_test_raw, dtype=float)
-            if M_train_raw.ndim == 1:
-                M_train_raw = M_train_raw[:, None]
-                M_test_raw = M_test_raw[:, None]
-
             m_scaler = StandardScaler()
-            M_train = m_scaler.fit_transform(M_train_raw)
-            M_test = m_scaler.transform(M_test_raw)
+            M_train = m_scaler.fit_transform(M_train_raw.reshape(-1,1))
+            M_test = m_scaler.transform(M_test_raw.reshape(-1,1))
         else:
             m_scaler = None
             M_train = None
@@ -229,11 +216,8 @@ class BiomarkerPipelineKFold:
             rng = np.random.default_rng(self.random_state + fold_idx * 10000 + i)
             boot_idx = rng.choice(len(X_train), size=len(X_train), replace=True)
             X_boot = X_train[boot_idx]
-            try:
-                y_boot = y_train.iloc[boot_idx]
-            except:
-                y_boot = y_train[boot_idx]
-                
+            y_boot = y_train.iloc[boot_idx]
+
             if len(np.unique(y_boot)) < 2:
                 failure_messages.append("bootstrap sample contained one class")
                 continue
@@ -312,7 +296,7 @@ class BiomarkerPipelineKFold:
             X_subset = X_train[:, idx]
             univar_idx, adj_p = univariate_filter(X_subset, y_train, self.univariate_threshold)
 
-            if len(univar_idx) > 0:
+            if len(univar_idx) > 10:
                 idx = [idx[i] for i in univar_idx]
                 if self.verbose:
                     print(f"    After univariate filtering: {len(idx)} proteins")
@@ -321,8 +305,8 @@ class BiomarkerPipelineKFold:
                 idx = [idx[i] for i in best_idx]
                 if self.verbose:
                     print(
-                        f"    No protein passed the FDR threshold; using top {len(idx)} "
-                        f"ranked proteins as exploratory fallback candidates."
+                        f"    Fewer than 10 proteins passed threshold; "
+                        f"using top {len(idx)} by FDR-adjusted p value"
                     )
 
         # Correlation filtering.
@@ -396,14 +380,7 @@ class BiomarkerPipelineKFold:
 
                 # selected_mask indexes X_model, which may include covariates.
                 # Keep only selected protein columns.
-                selected_mask = np.asarray(selected_mask)
-                if selected_mask.dtype == bool:
-                    selected_protein_mask = np.flatnonzero(selected_mask[: len(idx)])
-                else:
-                    selected_protein_mask = selected_mask.astype(int)
-                    selected_protein_mask = selected_protein_mask[
-                        selected_protein_mask < len(idx)
-                    ]
+                selected_protein_mask = [m for m in selected_mask if m < len(idx)]
 
                 if len(selected_protein_mask) > 0:
                     idx = [idx[i] for i in selected_protein_mask]
@@ -462,6 +439,7 @@ class BiomarkerPipelineKFold:
             )
             #predict
             y_pred_proba = model.predict_proba(X_test_model)[:, 1]
+            #y_pred = (y_pred_proba >= 0.5).astype(int)
             y_pred = model.predict(X_test_model)
             
             auc = roc_auc_score(y_test, y_pred_proba)
@@ -504,6 +482,7 @@ class BiomarkerPipelineKFold:
 
         self.cv_results = []
         fold_idx = 0
+
         for train_idx, test_idx in rskf.split(self.X_dev_raw, self.y_dev):
             fold_idx += 1
 
@@ -514,12 +493,8 @@ class BiomarkerPipelineKFold:
 
             X_train_raw = self.X_dev_raw[train_idx]
             X_test_raw = self.X_dev_raw[test_idx]
-            try:
-                y_train = self.y_dev.iloc[train_idx]
-                y_test = self.y_dev.iloc[test_idx]
-            except:
-                y_train = self.y_dev[train_idx]
-                y_test = self.y_dev[test_idx]
+            y_train = self.y_dev[train_idx]
+            y_test = self.y_dev[test_idx]
 
             M_train_raw = self.M_dev_raw[train_idx] if self.M_dev_raw is not None else None
             M_test_raw = self.M_dev_raw[test_idx] if self.M_dev_raw is not None else None
@@ -541,6 +516,7 @@ class BiomarkerPipelineKFold:
 
             if self.verbose:
                 print("\n[1] Random Forest Feature Selection")
+
             rf_panels = self.run_random_forest_fold(
                 X_train=X_train,
                 y_train=y_train,
@@ -687,28 +663,10 @@ class BiomarkerPipelineKFold:
 
             repeat_test_metrics = [f["test_metrics"] for f in repeat_folds]
 
-            y_true = np.concatenate([
-                np.asarray(m["y_true"], dtype=int) for m in repeat_test_metrics
-            ])
-            y_pred = np.concatenate([
-                np.asarray(m["y_pred"], dtype=int) for m in repeat_test_metrics
-            ])
-            y_prob = np.concatenate([
-                np.asarray(m["y_pred_proba"], dtype=float) for m in repeat_test_metrics
-            ])
-
-            auc = roc_auc_score(y_true, y_prob)
-            cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-            tn, fp, fn, tp = cm.ravel()
-            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-            specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-            accuracy = (tp + tn) / np.sum(cm) if np.sum(cm) > 0 else np.nan
-
-            repeat_metrics["auc"].append(float(auc))
-            repeat_metrics["sensitivity"].append(float(sensitivity))
-            repeat_metrics["specificity"].append(float(specificity))
-            repeat_metrics["accuracy"].append(float(accuracy))
-        
+            for metric in repeat_metrics:
+                repeat_metrics[metric].append(
+                    float(np.nanmean([m[metric] for m in repeat_test_metrics]))
+                )
 
             if self.verbose:
                 print(f"\nRepeat {repeat_idx + 1}:")
@@ -729,12 +687,13 @@ class BiomarkerPipelineKFold:
             values = np.asarray(values, dtype=float)
             mean = float(np.nanmean(values))
             std = float(np.nanstd(values, ddof=1)) if len(values) > 1 else 0.0
+            se = float(std / np.sqrt(len(values))) if len(values) > 1 else 0.0
 
-            # MODIFIED: Repeated-CV runs are not independent cohorts. Therefore,
-            # do not report a t-based 95% CI. Mean ± SD is retained as an internal
-            # resampling summary. The tuple shape is preserved for compatibility.
-            se = np.nan
-            ci = (np.nan, np.nan)
+            if len(values) > 1:
+                t_critical = stats.t.ppf(0.975, len(values) - 1)
+                ci = (mean - t_critical * se, mean + t_critical * se)
+            else:
+                ci = (np.nan, np.nan)
 
             summary[metric] = (mean, std, se, ci)
 
@@ -771,19 +730,12 @@ class BiomarkerPipelineKFold:
         ]
 
         # Fit scaler on full development set only.
-        if self.standardscale:
-            self.final_x_scaler = StandardScaler()
-            X_dev = self.final_x_scaler.fit_transform(self.X_dev_raw)
-        else:
-            self.final_x_scaler = None
-            X_dev = np.asarray(self.X_dev_raw, dtype=float)
+        self.final_x_scaler = StandardScaler()
+        X_dev = self.final_x_scaler.fit_transform(self.X_dev_raw)
 
         if self.M_dev_raw is not None:
-            if self.standarscale:
-                self.final_m_scaler = StandardScaler()
-                M_dev = self.final_m_scaler.fit_transform(self.M_dev_raw.reshape(-1,1))
-            else:
-                M_dev = np.asarray(self.M_dev_raw.reshape(-1,1), dtype=float)
+            self.final_m_scaler = StandardScaler()
+            M_dev = self.final_m_scaler.fit_transform(self.M_dev_raw.reshape(-1,1))
         else:
             self.final_m_scaler = None
             M_dev = None
@@ -812,7 +764,7 @@ class BiomarkerPipelineKFold:
             print(f"Final model trained with {len(final_idx)} protein features.")
             print(f"Proteins: {', '.join(self.final_selected_genes)}")
             if self.M_raw is not None:
-                print(f"Covariates included in model: {self.added_coef}")
+                print(f"Covariates included in model: {list(self.added_coef)}")
 
         return self.final_model
 
@@ -834,11 +786,7 @@ class BiomarkerPipelineKFold:
         ]
 
         # Transform holdout using development-set scalers.
-        X_holdout = (
-            self.final_x_scaler.transform(self.X_holdout_raw)
-            if self.final_x_scaler is not None
-            else np.asarray(self.X_holdout_raw, dtype=float)
-        )
+        X_holdout = self.final_x_scaler.transform(self.X_holdout_raw)
         X_holdout_final = X_holdout[:, final_idx]
 
         if self.M_holdout_raw is not None:
@@ -850,7 +798,7 @@ class BiomarkerPipelineKFold:
 
         try:
             y_pred_proba = self.final_model.predict_proba(X_holdout_model)[:, 1]
-            y_pred = self.final_model.predict(X_holdout_model)
+            y_pred = model.predict(X_holdout_model)
 
             auc = roc_auc_score(self.y_holdout, y_pred_proba)
             cm = confusion_matrix(self.y_holdout, y_pred, labels=[0, 1])
@@ -886,14 +834,117 @@ class BiomarkerPipelineKFold:
                 print(f"Holdout evaluation failed: {str(e)}")
             return None
 
+    def run_permutation_test(self, n_permutations=1000):
+        """
+        Secondary permutation-based robustness assessment.
 
-    def run_complete_pipeline(self):
+        This is not an external validation test because final proteins were
+        selected using the same development data.
+        """
+        if self.final_selected_genes is None or len(self.final_selected_genes) == 0:
+            if self.verbose:
+                print("No proteins to test.")
+            return None
+
+        if self.final_model is None:
+            self.train_final_model()
+
+        final_idx = [
+            np.where(self.gene_names == g)[0][0]
+            for g in self.final_selected_genes
+        ]
+
+        if self.final_x_scaler is None:
+            self.final_x_scaler = StandardScaler().fit(self.X_dev_raw)
+
+        X_dev = self.final_x_scaler.transform(self.X_dev_raw)
+        X_sel = X_dev[:, final_idx]
+
+        if self.M_dev_raw is not None:
+            if self.final_m_scaler is None:
+                self.final_m_scaler = StandardScaler().fit(self.M_dev_raw)
+            M_dev = self.final_m_scaler.transform(self.M_dev_raw)
+        else:
+            M_dev = None
+
+        X_model = append_covariates(X_sel, M_dev)
+
+        observed_coef = np.abs(np.ravel(self.final_model.coef_)[: len(final_idx)])
+
+        rng = np.random.default_rng(self.random_state)
+        null_coef = np.zeros((n_permutations, len(final_idx)), dtype=float)
+
+        inner_cv = safe_inner_cv(self.y_dev, max_cv=3)
+
+        if self.verbose:
+            print(f"\n{'=' * 70}")
+            print(f"PERMUTATION TEST (n={n_permutations})")
+            print(f"{'=' * 70}")
+
+        for b in tqdm(range(n_permutations), desc="Permutation", leave=False):
+            y_perm = rng.permutation(self.y_dev)
+
+            try:
+                _, perm_model = fit_elastic_net(
+                    X_model,
+                    y_perm,
+                    l1_ratio=self.elastic_net_l1_ratio,
+                    cv=inner_cv,
+                    random_state=self.random_state + b + 100000,
+                    class_weight=self.class_weight,
+                )
+                null_coef[b, :] = np.abs(np.ravel(perm_model.coef_)[: len(final_idx)])
+            except Exception:
+                null_coef[b, :] = np.nan
+
+        p_values = []
+        for j in range(len(final_idx)):
+            null_j = null_coef[:, j]
+            null_j = null_j[~np.isnan(null_j)]
+
+            if len(null_j) == 0:
+                p = np.nan
+            else:
+                p = (1 + np.sum(null_j >= observed_coef[j])) / (len(null_j) + 1)
+
+            p_values.append(p)
+
+        p_values = np.asarray(p_values, dtype=float)
+
+        valid = ~np.isnan(p_values)
+        adjusted_p = np.full_like(p_values, fill_value=np.nan, dtype=float)
+
+        if np.any(valid):
+            _, adjusted_p_valid, _, _ = multipletests(p_values[valid], method="fdr_bh")
+            adjusted_p[valid] = adjusted_p_valid
+
+        results_df = pd.DataFrame({
+            "Protein": self.final_selected_genes,
+            "Observed_abs_coef": observed_coef,
+            "P_value": p_values,
+            "FDR": adjusted_p,
+        }).sort_values("FDR")
+
+        self.permutation_results = results_df
+
+        if self.verbose:
+            print("\nPermutation Test Results:")
+            print(results_df.to_string(index=False))
+            sig = results_df[results_df["FDR"] < 0.1]
+            print(f"\nPermutation-supported proteins (FDR < 0.1): {len(sig)}/{len(results_df)}")
+
+        return results_df
+
+    def run_complete_pipeline(self, run_permutation=True, n_permutations=1000):
         self.run_repeated_cv()
         self.train_final_model()
 
         if self.use_holdout:
             self.evaluate_on_holdout()
-            
+
+        if run_permutation and self.final_selected_genes is not None:
+            self.run_permutation_test(n_permutations=n_permutations)
+
         self.print_final_report()
 
         return {
@@ -902,6 +953,7 @@ class BiomarkerPipelineKFold:
             "final_model": self.final_model,
             "cv_performance": self.cv_mean_metrics,
             "holdout_performance": self.holdout_performance,
+            "permutation_results": self.permutation_results,
         }
 
     def print_final_report(self):
@@ -918,7 +970,7 @@ class BiomarkerPipelineKFold:
         print(f"   Class names:         {list(self.class_names_)}")
 
         if self.M_raw is not None:
-            print(f"   Covariates:          {self.added_coef}")
+            print(f"   Covariates:          {list(self.added_coef)}")
 
         if self.final_selected_genes is not None:
             print("\n2. Selected Biomarkers:")
@@ -943,7 +995,13 @@ class BiomarkerPipelineKFold:
             print(f"   Specificity: {self.holdout_performance['specificity']:.4f}")
             print(f"   Accuracy:    {self.holdout_performance['accuracy']:.4f}")
 
-
+        if self.permutation_results is not None:
+            sig_genes = len(self.permutation_results[self.permutation_results["FDR"] < 0.1])
+            print("\n5. Permutation Test:")
+            print(
+                f"   Permutation-supported proteins "
+                f"(FDR < 0.1): {sig_genes}/{len(self.permutation_results)}"
+            )
 
         print(f"\n{'=' * 70}")
         print("INTERPRETATION NOTE")

@@ -19,12 +19,13 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def append_covariates(X, M):
+def _append_covariates(X, M):
     if M is None:
         return X
     return np.concatenate([X, M], axis=1)
 
-def safe_inner_cv(y, max_cv=3):
+@staticmethod
+def _safe_inner_cv(y, max_cv=3):
     counts = np.bincount(y)
     if len(counts) < 2:
         return 0
@@ -32,7 +33,7 @@ def safe_inner_cv(y, max_cv=3):
     cv = min(max_cv, min_class)
     return cv if cv >= 2 else 0
 
-def check_sample_adequacy(n_samples, n_features, sample_feature_min_ratio, sample_feature_warning_ratio):
+def _check_sample_adequacy(n_samples, n_features, sample_feature_min_ratio, sample_feature_warning_ratio):
     if n_features == 0:
         return "critical", 0.0
 
@@ -44,13 +45,13 @@ def check_sample_adequacy(n_samples, n_features, sample_feature_min_ratio, sampl
         return "warning", ratio
     return "adequate", ratio
 
-def compute_frequencies(rf_panels):
+def _compute_frequencies(rf_panels):
     flattened = []
     for panel in rf_panels:
         flattened.extend(panel)
     return pd.Series(Counter(flattened)).sort_values(ascending=False)
 
-def get_highfreq(gene_freq, highfreq_quantile, rf_selection_size):
+def _get_highfreq(gene_freq, highfreq_quantile, rf_selection_size):
     if gene_freq is None or len(gene_freq) == 0:
         return pd.Series(dtype=float)
 
@@ -63,7 +64,7 @@ def get_highfreq(gene_freq, highfreq_quantile, rf_selection_size):
     return high_freq
         
 
-def univariate_filter(X_subset, y, univariate_threshold, correction='fdr_bh'):
+def _univariate_filter(X_subset, y, univariate_threshold, correction='fdr_bh'):
     p_values = []
 
     for j in range(X_subset.shape[1]):
@@ -90,7 +91,7 @@ def univariate_filter(X_subset, y, univariate_threshold, correction='fdr_bh'):
 
     return selected, adj_p
 
-def fit_elastic_net(X, y, l1_ratio, cv, random_state, class_weight=None):
+def _fit_elastic_net(X, y, l1_ratio, cv, random_state, class_weight=None):
     if len(np.unique(y)) != 2:
         return np.array([], dtype=int), None
 

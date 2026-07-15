@@ -98,7 +98,7 @@ def get_r2(pMB_, eps=1e-12):
         + (1 - y_dev) * np.log(1 - prevalence)
     )
 
-    # c-R2
+    # McFadden pseudo-R2
     pseudo_r2 = 1 - (ll_model / ll_null)
     n_parameters = n_features + 1
 

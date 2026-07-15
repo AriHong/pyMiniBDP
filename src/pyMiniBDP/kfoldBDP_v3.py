@@ -229,11 +229,8 @@ class BiomarkerPipelineKFold:
             rng = np.random.default_rng(self.random_state + fold_idx * 10000 + i)
             boot_idx = rng.choice(len(X_train), size=len(X_train), replace=True)
             X_boot = X_train[boot_idx]
-            try:
-                y_boot = y_train.iloc[boot_idx]
-            except:
-                y_boot = y_train[boot_idx]
-                
+            y_boot = y_train.iloc[boot_idx]
+
             if len(np.unique(y_boot)) < 2:
                 failure_messages.append("bootstrap sample contained one class")
                 continue
@@ -514,12 +511,8 @@ class BiomarkerPipelineKFold:
 
             X_train_raw = self.X_dev_raw[train_idx]
             X_test_raw = self.X_dev_raw[test_idx]
-            try:
-                y_train = self.y_dev.iloc[train_idx]
-                y_test = self.y_dev.iloc[test_idx]
-            except:
-                y_train = self.y_dev[train_idx]
-                y_test = self.y_dev[test_idx]
+            y_train = self.y_dev.iloc[train_idx]
+            y_test = self.y_dev.iloc[test_idx]
 
             M_train_raw = self.M_dev_raw[train_idx] if self.M_dev_raw is not None else None
             M_test_raw = self.M_dev_raw[test_idx] if self.M_dev_raw is not None else None
@@ -779,11 +772,8 @@ class BiomarkerPipelineKFold:
             X_dev = np.asarray(self.X_dev_raw, dtype=float)
 
         if self.M_dev_raw is not None:
-            if self.standarscale:
-                self.final_m_scaler = StandardScaler()
-                M_dev = self.final_m_scaler.fit_transform(self.M_dev_raw.reshape(-1,1))
-            else:
-                M_dev = np.asarray(self.M_dev_raw.reshape(-1,1), dtype=float)
+            self.final_m_scaler = StandardScaler()
+            M_dev = self.final_m_scaler.fit_transform(self.M_dev_raw.reshape(-1,1))
         else:
             self.final_m_scaler = None
             M_dev = None
@@ -852,6 +842,8 @@ class BiomarkerPipelineKFold:
             y_pred_proba = self.final_model.predict_proba(X_holdout_model)[:, 1]
             y_pred = self.final_model.predict(X_holdout_model)
 
+            y_pred = self.final_model.predict(X_holdout_model)
+
             auc = roc_auc_score(self.y_holdout, y_pred_proba)
             cm = confusion_matrix(self.y_holdout, y_pred, labels=[0, 1])
             tn, fp, fn, tp = cm.ravel()
@@ -888,6 +880,8 @@ class BiomarkerPipelineKFold:
 
 
     def run_complete_pipeline(self):
+        print(type(self.y))
+        print(type(self.y_dev))
         self.run_repeated_cv()
         self.train_final_model()
 
